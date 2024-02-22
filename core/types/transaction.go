@@ -51,6 +51,23 @@ const (
 	BlobTxType       = 0x03
 )
 
+type Message struct {
+	to                *common.Address
+	from              common.Address
+	nonce             uint64
+	amount            *big.Int
+	gasLimit          uint64
+	gasPrice          *big.Int
+	gasFeeCap         *big.Int
+	gasTipCap         *big.Int
+	data              []byte
+	accessList        AccessList
+	blobGasFeeCap     *big.Int
+	blobHashes        []common.Hash
+	skipAccountChecks bool
+	isFake            bool
+}
+
 // Transaction is an Ethereum transaction.
 type Transaction struct {
 	inner TxData    // Consensus contents of a transaction
@@ -572,6 +589,38 @@ func HashDifference(a, b []common.Hash) []common.Hash {
 	return keep
 }
 
+// AsMessage returns the transaction as a core.Message.
+func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
+	msg := Message{
+		nonce:      tx.Nonce(),
+		gasLimit:   tx.Gas(),
+		gasPrice:   new(big.Int).Set(tx.GasPrice()),
+		gasFeeCap:  new(big.Int).Set(tx.GasFeeCap()),
+		gasTipCap:  new(big.Int).Set(tx.GasTipCap()),
+		to:         tx.To(),
+		amount:     tx.Value(),
+		data:       tx.Data(),
+		accessList: tx.AccessList(),
+		isFake:     false,
+	}
+	// If baseFee provided, set gasPrice to effectiveGasPrice.
+	if baseFee != nil {
+		msg.gasPrice = math.BigMin(msg.gasPrice.Add(msg.gasTipCap, baseFee), msg.gasFeeCap)
+	}
+	var err error
+	msg.from, err = Sender(s, tx)
+	return msg, err
+}
+
+// AsMessageNoNonceCheck returns the transaction with checkNonce field set to be false.
+func (tx *Transaction) AsMessageNoNonceCheck(s Signer) (Message, error) {
+	msg, err := tx.AsMessage(s, nil)
+	if err == nil {
+		msg.isFake = true
+	}
+	return msg, err
+}
+
 // TxByNonce implements the sort interface to allow sorting a list of transactions
 // by their nonces. This is usually only useful for sorting transactions from a
 // single account, otherwise a nonce comparison doesn't make much sense.
@@ -580,6 +629,22 @@ type TxByNonce Transactions
 func (s TxByNonce) Len() int           { return len(s) }
 func (s TxByNonce) Less(i, j int) bool { return s[i].Nonce() < s[j].Nonce() }
 func (s TxByNonce) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+func (m Message) From() common.Address   { return m.from }
+func (m Message) To() *common.Address    { return m.to }
+func (m Message) GasPrice() *big.Int     { return m.gasPrice }
+func (m Message) GasFeeCap() *big.Int    { return m.gasFeeCap }
+func (m Message) GasTipCap() *big.Int    { return m.gasTipCap }
+func (m Message) Value() *big.Int        { return m.amount }
+func (m Message) Gas() uint64            { return m.gasLimit }
+func (m Message) Nonce() uint64          { return m.nonce }
+func (m Message) Data() []byte           { return m.data }
+func (m Message) AccessList() AccessList { return m.accessList }
+func (m Message) IsFake() bool           { return m.isFake }
+
+func (m Message) BlobGasFeeCap() *big.Int   { return m.blobGasFeeCap }
+func (m Message) BlobHashes() []common.Hash { return m.blobHashes }
+func (m Message) SkipAccountChecks() bool   { return m.skipAccountChecks }
 
 // copyAddressPtr copies an address.
 func copyAddressPtr(a *common.Address) *common.Address {

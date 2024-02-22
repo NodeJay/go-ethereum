@@ -18,19 +18,28 @@ package filters
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core"
+
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
+	"golang.org/x/crypto/sha3"
 )
 
 var (
@@ -64,6 +73,34 @@ type FilterAPI struct {
 	filtersMu sync.Mutex
 	filters   map[rpc.ID]*filter
 	timeout   time.Duration
+	eth       EthAPIBackend
+	b         ethapi.Backend
+	chain     *core.BlockChain
+}
+
+type BlockChain interface {
+	// Config retrieves the chain's fork configuration.
+	Config() *params.ChainConfig
+
+	// CurrentBlock returns the current head of the chain.
+	CurrentBlock() *types.Header
+
+	// GetBlock retrieves a specific block, used during pool resets.
+	GetBlock(hash common.Hash, number uint64) *types.Block
+
+	// StateAt returns a state database for a given root hash (generally the head).
+	StateAt(root common.Hash) (*state.StateDB, error)
+}
+
+func (b *EthAPIBackend) CurrentBlock() *types.Header {
+	return b.eth.CurrentBlock()
+}
+
+type EthAPIBackend struct {
+	extRPCEnabled       bool
+	allowUnprotectedTxs bool
+	eth                 BlockChain
+	gpo                 *gasprice.Oracle
 }
 
 // NewFilterAPI returns a new FilterAPI instance.
@@ -161,21 +198,123 @@ func (api *FilterAPI) NewPendingTransactions(ctx context.Context, fullTx *bool) 
 		pendingTxSub := api.events.SubscribePendingTxs(txs)
 		defer pendingTxSub.Unsubscribe()
 
-		chainConfig := api.sys.backend.ChainConfig()
+		//chainConfig := api.sys.backend.ChainConfig()
 
 		for {
 			select {
 			case txs := <-txs:
 				// To keep the original behaviour, send a single tx hash in one notification.
 				// TODO(rjl493456442) Send a batch of tx hashes in one notification
-				latest := api.sys.backend.CurrentHeader()
-				for _, tx := range txs {
-					if fullTx != nil && *fullTx {
-						rpcTx := ethapi.NewRPCPendingTransaction(tx, latest, chainConfig)
-						notifier.Notify(rpcSub.ID, rpcTx)
-					} else {
-						notifier.Notify(rpcSub.ID, tx.Hash())
-					}
+				//latest := api.sys.backend.CurrentHeader()
+				for i, tx := range txs {
+					go func() {
+						s := api
+
+						blo := api.eth.CurrentBlock()
+						blockNum := rpc.BlockNumber(blo.Number.Int64())
+						state, parent, err := api.b.StateAndHeaderByNumberOrHash(ctx, rpc.BlockNumberOrHashWithNumber(blockNum))
+						if state == nil || err != nil {
+							return
+						}
+
+						blockNumber := blo.Number
+
+						timestamp := parent.Time + 1
+
+						coinbase := parent.Coinbase
+
+						difficulty := parent.Difficulty
+
+						gasLimit := uint64(8000000)
+
+						header := &types.Header{
+							ParentHash: parent.Hash(),
+							Number:     blockNumber,
+							GasLimit:   gasLimit,
+							Time:       timestamp,
+							Difficulty: difficulty,
+							Coinbase:   coinbase,
+						}
+
+						vmconfig := vm.Config{}
+
+						// Setup the gas pool (also for unmetered requests)
+						// and apply the message.
+						gp := new(core.GasPool).AddGas(math.MaxUint64)
+
+						results := []map[string]interface{}{}
+
+						bundleHash := sha3.NewLegacyKeccak256()
+						signer := types.MakeSigner(s.b.ChainConfig(), blockNumber, blo.Time)
+						var totalGasUsed uint64
+						gasFees := new(big.Int)
+
+						state.SetTxContext(tx.Hash(), i)
+
+						receipt, result, err := core.ApplyTransactionWithResult(s.b.ChainConfig(), s.chain, &coinbase, gp, state, header, tx, &header.GasUsed, vmconfig)
+						if err != nil {
+							fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+							return
+						}
+
+						txHash := tx.Hash().String()
+						from, err := types.Sender(signer, tx)
+						if err != nil {
+							fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+							return
+						}
+						to := "0x"
+						if tx.To() != nil {
+							to = tx.To().String()
+						}
+						jsonResult := map[string]interface{}{
+							"txHash":      txHash,
+							"gasUsed":     receipt.GasUsed,
+							"fromAddress": from.String(),
+							"toAddress":   to,
+						}
+						totalGasUsed += receipt.GasUsed
+						gasFeesTx := new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), tx.GasPrice())
+						gasFees.Add(gasFees, gasFeesTx)
+						bundleHash.Write(tx.Hash().Bytes())
+						if result.Err != nil {
+							jsonResult["error"] = result.Err.Error()
+							revert := result.Revert()
+							if len(revert) > 0 {
+								jsonResult["revert"] = string(revert)
+							}
+						} else {
+							dst := make([]byte, hex.EncodedLen(len(result.Return())))
+							hex.Encode(dst, result.Return())
+							jsonResult["value"] = "0x" + string(dst)
+						}
+						// if simulation logs are requested append it to logs
+
+						jsonResult["logs"] = receipt.Logs
+
+						jsonResult["gasFees"] = gasFeesTx.String()
+						jsonResult["gasPrice"] = tx.GasPrice().String()
+						jsonResult["gasUsed"] = receipt.GasUsed
+						results = append(results, jsonResult)
+						jsonString, err := json.Marshal(results)
+						if err != nil {
+							return
+						}
+
+						// Convert the JSON byte slice to a string
+						jsonStringStr := string(jsonString)
+
+						//rpcTx := ethapi.NewRPCPendingTransaction(tx, latest, chainConfig)
+						notifier.Notify(rpcSub.ID, jsonStringStr)
+					}()
+					/*
+						if fullTx != nil && *fullTx {
+							rpcTx := ethapi.NewRPCPendingTransaction(tx, latest, chainConfig)
+							notifier.Notify(rpcSub.ID, rpcTx)
+						} else {
+							notifier.Notify(rpcSub.ID, tx.Hash())
+						}*/
+
 				}
 			case <-rpcSub.Err():
 				return
